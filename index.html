@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TeleRehab – MVP (Pose + Conteo)</title>
+  <title>TeleRehab – MVP (MediaPipe Tasks)</title>
   <style>
     :root { --bg:#0b1020; --card:#121933; --text:#e9eefc; --accent:#6aa7ff; }
     *{box-sizing:border-box}
@@ -31,7 +31,7 @@
 </head>
 <body>
   <header>
-    <h1>TeleRehab · MVP mínimo (Web)</h1>
+    <h1>TeleRehab · MVP (MediaPipe Tasks Pose)</h1>
     <div class="row">
       <button id="btnStart" class="primary">Iniciar cámara</button>
       <button id="btnStop">Detener</button>
@@ -72,9 +72,9 @@
     <section class="panel">
       <strong>Indicaciones rápidas</strong>
       <ul class="tips">
-        <li>Colócate de pie, con luz frontal y fondo simple. Mantén todo el cuerpo dentro de la cámara.</li>
-        <li>Para el brazo: extiende y eleva hasta casi línea con la cabeza. Para la rodilla: flexiona como si fueras a sentarte.</li>
-        <li>El conteo registra una repetición cuando completas el ciclo <em>abajo → arriba → abajo</em>.</li>
+        <li>De pie, con luz frontal y fondo simple. Mantén todo el cuerpo dentro del encuadre.</li>
+        <li>Brazos: eleva hasta casi la línea de la cabeza. Rodilla: flexiona como si fueras a sentarte.</li>
+        <li>Se cuenta una repetición al completar el ciclo <em>abajo → arriba → abajo</em>.</li>
       </ul>
     </section>
   </main>
@@ -83,17 +83,11 @@
     Procesamiento on‑device. No se envía video a servidores. MVP educativo.
   </footer>
 
-  <!-- MediaPipe (versión clásica) -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils"></script>
+  <!-- MediaPipe Tasks Vision Bundle -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js"></script>
 
   <script>
-    // Utilidades de dibujo de MediaPipe
-    const { drawConnectors, drawLandmarks } = window;
-    const { POSE_CONNECTIONS } = window;
-
-    // Elementos de UI
+    // ===== Utilidades generales =====
     const videoEl = document.getElementById('input_video');
     const canvasEl = document.getElementById('output_canvas');
     const ctx = canvasEl.getContext('2d');
@@ -106,244 +100,212 @@
     const selRes = document.getElementById('resolution');
     const chkVoice = document.getElementById('chkVoice');
 
-    // Estado del ejercicio
-    let camera = null;
+    let landmarker = null;
+    let stream = null;
+    let animId = null;
     let reps = 0;
-    let phase = 'down'; // down -> up -> down (cuenta)
-    let lastTs = performance.now();
+    let phase = 'down';
     let frames = 0;
-    let speakingCooldown = 0; // ms
+    let lastTs = performance.now();
+    let speakingCooldown = 0;
 
     function say(text){
       if(!chkVoice.checked) return;
       const now = performance.now();
       if(now < speakingCooldown) return;
-      speakingCooldown = now + 1200; // evita hablar demasiado
+      speakingCooldown = now + 1200;
       const u = new SpeechSynthesisUtterance(text);
       u.lang = 'es-AR';
+      speechSynthesis.cancel();
       speechSynthesis.speak(u);
     }
 
-    function toRad(d){return d * Math.PI / 180}
-    function dist(a,b){return Math.hypot(a.x-b.x, a.y-b.y)}
-    function angleABC(a,b,c){
-      // Ángulo en B (en grados) formado por puntos A-B-C
-      const ab = {x:a.x-b.x, y:a.y-b.y};
-      const cb = {x:c.x-b.x, y:c.y-b.y};
-      const dot = ab.x*cb.x + ab.y*cb.y;
-      const mag = Math.hypot(ab.x,ab.y)*Math.hypot(cb.x,cb.y) || 1e-6;
-      const cos = Math.min(1, Math.max(-1, dot/mag));
-      return Math.round(Math.acos(cos)*180/Math.PI);
+    function getConstraints(){
+      const [w,h] = selRes.value.split('x').map(Number);
+      return { audio:false, video:{ facingMode:'user', width:{ideal:w}, height:{ideal:h} } };
     }
 
-    function clamp(v,min,max){return Math.max(min,Math.min(max,v))}
+    function angleABC(a,b,c){
+      const abx = a.x - b.x, aby = a.y - b.y;
+      const cbx = c.x - b.x, cby = c.y - b.y;
+      const dot = abx*cbx + aby*cby;
+      const mag = Math.hypot(abx,aby) * Math.hypot(cbx,cby) || 1e-6;
+      const cos = Math.min(1, Math.max(-1, dot/mag));
+      return Math.round(Math.acos(cos) * 180/Math.PI);
+    }
 
-    function getLandmarkSafe(landmarks, idx){
-      const lm = landmarks?.[idx];
-      if(!lm || lm.visibility !== undefined && lm.visibility < 0.1) return null;
+    function safeLm(lms, idx){
+      const lm = lms?.[idx];
+      if(!lm) return null;
+      if(lm.visibility !== undefined && lm.visibility < 0.1) return null;
       return lm;
     }
 
-    function computeAngleForExercise(landmarks, exercise){
+    function computeAngle(landmarks, exercise){
       if(!landmarks) return null;
-      // Índices MP Pose: hombro 11/12, codo 13/14, muñeca 15/16, cadera 23/24, rodilla 25/26, tobillo 27/28
+      // Índices BlazePose (33 puntos):
+      // hombro 11/12, codo 13/14, muñeca 15/16, cadera 23/24, rodilla 25/26, tobillo 27/28
       switch(exercise){
         case 'arm_right':{
-          const sh = getLandmarkSafe(landmarks, 12);
-          const el = getLandmarkSafe(landmarks, 14);
-          const wr = getLandmarkSafe(landmarks, 16);
+          const sh = safeLm(landmarks,12);
+          const el = safeLm(landmarks,14);
+          const wr = safeLm(landmarks,16);
           if(!sh||!el||!wr) return null;
-          return angleABC(sh, el, wr); // ángulo de codo
+          return angleABC(sh,el,wr); // codo derecho
         }
         case 'arm_left':{
-          const sh = getLandmarkSafe(landmarks, 11);
-          const el = getLandmarkSafe(landmarks, 13);
-          const wr = getLandmarkSafe(landmarks, 15);
+          const sh = safeLm(landmarks,11);
+          const el = safeLm(landmarks,13);
+          const wr = safeLm(landmarks,15);
           if(!sh||!el||!wr) return null;
-          return angleABC(sh, el, wr);
+          return angleABC(sh,el,wr); // codo izquierdo
         }
         case 'knee_right':{
-          const hp = getLandmarkSafe(landmarks, 24);
-          const kn = getLandmarkSafe(landmarks, 26);
-          const an = getLandmarkSafe(landmarks, 28);
+          const hp = safeLm(landmarks,24);
+          const kn = safeLm(landmarks,26);
+          const an = safeLm(landmarks,28);
           if(!hp||!kn||!an) return null;
-          return angleABC(hp, kn, an); // ángulo de rodilla
+          return angleABC(hp,kn,an); // rodilla derecha
         }
         case 'knee_left':{
-          const hp = getLandmarkSafe(landmarks, 23);
-          const kn = getLandmarkSafe(landmarks, 25);
-          const an = getLandmarkSafe(landmarks, 27);
+          const hp = safeLm(landmarks,23);
+          const kn = safeLm(landmarks,25);
+          const an = safeLm(landmarks,27);
           if(!hp||!kn||!an) return null;
-          return angleABC(hp, kn, an);
+          return angleABC(hp,kn,an); // rodilla izquierda
         }
       }
       return null;
     }
 
     function evalExercise(angle, exercise){
-      // Devuelve {isUp, hints}
-      if(angle==null) return {isUp:false, hints:['Cuerpo fuera de cuadro']};
+      if(angle==null) return {isUp:false,isDown:false,hints:['Cuerpo fuera de cuadro']};
       if(exercise.startsWith('arm')){
-        // brazo: up >= 160°, down <= 60°
-        const hints=[];
-        if(angle < 140) hints.push('Eleva un poco más el brazo');
-        return {isUp: angle >= 160, isDown: angle <= 60, hints};
+        // Brazo: up >= 160°, down <= 60°
+        const hints=[]; if(angle<140) hints.push('Eleva más el brazo');
+        return {isUp: angle>=160, isDown: angle<=60, hints};
       } else {
-        // rodilla: posición baja 60–90°; up ~ 160–180°
-        const hints=[];
-        if(angle > 110) hints.push('Flexiona más la rodilla');
-        return {isUp: angle >= 150, isDown: angle <= 90, hints};
+        // Rodilla: baja 60–90°, up >= 150°
+        const hints=[]; if(angle>110) hints.push('Flexiona más la rodilla');
+        return {isUp: angle>=150, isDown: angle<=90, hints};
       }
     }
 
-    function draw(results, angle, qualityColor){
-      const w = results.image.width, h = results.image.height;
-      if(canvasEl.width !== w){ canvasEl.width = w; canvasEl.height = h; }
-      ctx.save();
-      ctx.clearRect(0,0,w,h);
-      ctx.drawImage(results.image, 0, 0, w, h);
+    // ===== Inicialización de MediaPipe Tasks =====
+    async function initPoseLandmarker(){
+      const { FilesetResolver, PoseLandmarker, DrawingUtils } = window;
+      const fileset = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm'
+      );
+      landmarker = await PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task'
+        },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      return { PoseLandmarker, DrawingUtils };
+    }
 
-      // Pose overlay
-      if(results.poseLandmarks){
-        drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, { lineWidth: 4, color: qualityColor || '#33ff99' });
-        drawLandmarks(ctx, results.poseLandmarks, { lineWidth: 2, color: '#ffffff' });
+    let drawingUtils = null; // instancia por canvas
+    let PoseConnections = null;
+
+    async function startCamera(){
+      if(!landmarker){
+        const { PoseLandmarker, DrawingUtils } = await initPoseLandmarker();
+        drawingUtils = new DrawingUtils(ctx);
+        PoseConnections = PoseLandmarker.POSE_CONNECTIONS;
       }
+      const constraints = getConstraints();
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      videoEl.srcObject = stream; await videoEl.play();
+      canvasEl.width = videoEl.videoWidth || 640;
+      canvasEl.height = videoEl.videoHeight || 480;
 
-      // Ángulo en pantalla
-      if(angle!=null){
+      reps = 0; phase = 'down'; repsEl.textContent = '0';
+      loop();
+    }
+
+    function stopCamera(){
+      if(animId) cancelAnimationFrame(animId);
+      animId = null;
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+      fpsEl.textContent = '–';
+    }
+
+    function loop(){
+      const ts = performance.now();
+      const w = videoEl.videoWidth, h = videoEl.videoHeight;
+      canvasEl.width = w; canvasEl.height = h;
+
+      const res = landmarker.detectForVideo(videoEl, ts);
+      ctx.drawImage(videoEl, 0, 0, w, h);
+
+      if(res && res.landmarks && res.landmarks.length){
+        const lms = res.landmarks[0];
+        // Dibujo del esqueleto
+        drawingUtils.drawConnectors(lms, PoseConnections);
+        drawingUtils.drawLandmarks(lms);
+
+        // Ángulo por ejercicio
+        const ang = computeAngle(lms, selExercise.value);
+        angleEl.textContent = ang==null ? '–' : ang.toString();
+        const {isUp,isDown,hints} = evalExercise(ang, selExercise.value);
+
+        // Máquina de estados de conteo
+        if(phase==='down' && isUp){ phase='up'; say('Arriba'); }
+        else if(phase==='up' && isDown){ phase='down'; reps++; repsEl.textContent = reps.toString(); say('Correcto'); }
+
+        // Hints de corrección
+        if(hints.length && ang!=null){
+          if(selExercise.value.startsWith('arm') && ang<140) say('Sube el brazo');
+          if(selExercise.value.startsWith('knee') && ang>110) say('Flexiona más');
+        }
+
+        // Tarjeta de ángulo
+        ctx.save();
         ctx.fillStyle = '#0e1530cc';
         ctx.strokeStyle = '#273055';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.roundRect(w-150, 12, 138, 48, 10);
-        ctx.fill();
-        ctx.stroke();
+        roundRect(ctx, w-150, 12, 138, 48, 10);
+        ctx.fill(); ctx.stroke();
         ctx.fillStyle = '#9fb2e8';
         ctx.font = '12px system-ui';
         ctx.fillText('Ángulo', w-135, 30);
         ctx.fillStyle = '#e9eefc';
         ctx.font = '22px system-ui';
-        ctx.fillText(`${angle}°`, w-135, 50);
+        ctx.fillText(ang==null?'–':`${ang}°`, w-135, 50);
+        ctx.restore();
       }
-      ctx.restore();
-    }
 
-    // Polyfill para roundRect en Canvas (por si acaso)
-    if(!CanvasRenderingContext2D.prototype.roundRect){
-      CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
-        if(typeof r === 'number') r = {tl:r,tr:r,br:r,bl:r};
-        this.beginPath();
-        this.moveTo(x+r.tl, y);
-        this.lineTo(x+w-r.tr, y);
-        this.quadraticCurveTo(x+w, y, x+w, y+r.tr);
-        this.lineTo(x+w, y+h-r.br);
-        this.quadraticCurveTo(x+w, y+h, x+w-r.br, y+h);
-        this.lineTo(x+r.bl, y+h);
-        this.quadraticCurveTo(x, y+h, x, y+h-r.bl);
-        this.lineTo(x, y+r.tl);
-        this.quadraticCurveTo(x, y, x+r.tl, y);
-        this.closePath();
-        return this;
-      }
-    }
-
-    // MediaPipe Pose
-    const pose = new Pose.Pose({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
-    });
-    pose.setOptions({
-      modelComplexity: 1,
-      smoothLandmarks: true,
-      enableSegmentation: false,
-      minDetectionConfidence: 0.6,
-      minTrackingConfidence: 0.6
-    });
-
-    pose.onResults(onResults);
-
-    async function onResults(results){
       // FPS
       frames++;
-      const now = performance.now();
-      if(now - lastTs >= 1000){
-        fpsEl.textContent = frames.toString();
-        frames = 0; lastTs = now;
-      }
-
-      const angle = computeAngleForExercise(results.poseLandmarks, selExercise.value);
-      angleEl.textContent = angle==null ? '–' : angle.toString();
-      const {isUp, isDown, hints} = evalExercise(angle, selExercise.value);
-
-      // Máquina de estados para contar reps
-      if(phase === 'down' && isUp){
-        phase = 'up';
-        say('Arriba');
-      } else if(phase === 'up' && isDown){
-        phase = 'down';
-        reps++;
-        repsEl.textContent = reps.toString();
-        say('Correcto');
-      }
-
-      // Color de calidad
-      const qualityColor = isUp ? '#56ffa0' : (isDown ? '#6aa7ff' : '#ff5d7a');
-
-      // Feedback de corrección
-      if(hints.length && (angle!=null)){
-        if(!isUp && selExercise.value.startsWith('arm') && angle < 140){
-          say('Sube un poco más el brazo');
-        }
-        if(!isDown && selExercise.value.startsWith('knee') && angle > 110){
-          say('Flexiona más la rodilla');
-        }
-      }
-
-      draw(results, angle, qualityColor);
+      if(ts - lastTs >= 1000){ fpsEl.textContent = String(frames); frames = 0; lastTs = ts; }
+      animId = requestAnimationFrame(loop);
     }
 
-    function getConstraints(){
-      const [w,h] = selRes.value.split('x').map(Number);
-      return {
-        audio:false,
-        video:{ facingMode: 'user', width: {ideal: w}, height: {ideal: h} }
-      };
-    }
-
-    async function startCamera(){
-      reps = 0; phase = 'down'; repsEl.textContent = '0';
-      const constraints = getConstraints();
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      videoEl.srcObject = stream;
-      await videoEl.play();
-
-      const w = videoEl.videoWidth || 640;
-      const h = videoEl.videoHeight || 480;
-      canvasEl.width = w; canvasEl.height = h;
-
-      if(camera) camera.stop();
-      camera = new Camera.Camera(videoEl, {
-        onFrame: async () => { await pose.send({image: videoEl}); },
-        width: w,
-        height: h
-      });
-      camera.start();
-    }
-
-    function stopCamera(){
-      if(camera){ camera.stop(); camera = null; }
-      const stream = videoEl.srcObject;
-      if(stream){ stream.getTracks().forEach(t=>t.stop()); }
-      videoEl.srcObject = null;
-      fpsEl.textContent = '–';
+    function roundRect(ctx,x,y,w,h,r){
+      if(typeof r==='number'){ r={tl:r,tr:r,br:r,bl:r}; }
+      ctx.moveTo(x+r.tl,y);
+      ctx.lineTo(x+w-r.tr,y);
+      ctx.quadraticCurveTo(x+w,y,x+w,y+r.tr);
+      ctx.lineTo(x+w,y+h-r.br);
+      ctx.quadraticCurveTo(x+w,y+h,x+w-r.br,y+h);
+      ctx.lineTo(x+r.bl,y+h);
+      ctx.quadraticCurveTo(x,y+h,x,y+h-r.bl);
+      ctx.lineTo(x,y+r.tl);
+      ctx.quadraticCurveTo(x,y,x+r.tl,y);
     }
 
     // Eventos UI
     btnStart.addEventListener('click', startCamera);
     btnStop.addEventListener('click', stopCamera);
-    selRes.addEventListener('change', ()=>{ if(camera) startCamera(); });
-
-    // Autostart (opcional): comentar la siguiente línea si no quieres que inicie sola
-    // startCamera();
+    selRes.addEventListener('change', ()=>{ if(stream) { stopCamera(); startCamera(); } });
   </script>
 </body>
 </html>
+
