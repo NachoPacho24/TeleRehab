@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TeleRehab – MVP (Pose + Conteo)</title>
+  <style>
+    :root { --bg:#0b1020; --card:#121933; --text:#e9eefc; --accent:#6aa7ff; }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto}
+    header{padding:16px 20px;border-bottom:1px solid #1e2748;display:flex;gap:12px;align-items:center;justify-content:space-between}
+    header h1{font-size:18px;margin:0;font-weight:600}
+    main{padding:16px;display:grid;gap:16px;grid-template-columns:1fr;max-width:1100px;margin:0 auto}
+    .panel{background:var(--card);border:1px solid #1e2748;border-radius:14px;padding:14px}
+    .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+    label{font-size:13px;opacity:.9}
+    select,button,input[type="checkbox"]{background:#0e1530;color:var(--text);border:1px solid #273055;border-radius:10px;padding:8px 10px;font-size:14px}
+    button{cursor:pointer}
+    button.primary{background:var(--accent);color:#0b1020;border-color:#6aa7ff;font-weight:600}
+    #stage{position:relative;max-width:900px;margin:0 auto}
+    video{display:none}
+    canvas{width:100%;height:auto;border-radius:14px;border:1px solid #1e2748;background:#000}
+    .badge{position:absolute;top:12px;left:12px;background:#0e1530cc;border:1px solid #273055;color:var(--text);padding:8px 10px;border-radius:10px;font-size:14px;backdrop-filter: blur(4px)}
+    .stats{display:flex;gap:10px;flex-wrap:wrap}
+    .stat{background:#0e1530;border:1px solid #273055;border-radius:12px;padding:10px 12px;min-width:100px;text-align:center}
+    .stat .label{font-size:12px;opacity:.75}
+    .stat .value{font-size:22px;font-weight:700;margin-top:2px}
+    .tips{font-size:13px;opacity:.9;line-height:1.5}
+    footer{padding:10px 16px;color:#9fb2e8;font-size:12px;opacity:.8;text-align:center}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TeleRehab · MVP mínimo (Web)</h1>
+    <div class="row">
+      <button id="btnStart" class="primary">Iniciar cámara</button>
+      <button id="btnStop">Detener</button>
+      <label><input type="checkbox" id="chkVoice" checked> Voz</label>
+      <label>
+        Ejercicio:
+        <select id="exercise">
+          <option value="arm_right">Elevación de brazo derecho</option>
+          <option value="arm_left">Elevación de brazo izquierdo</option>
+          <option value="knee_right">Flexión de rodilla derecha</option>
+          <option value="knee_left">Flexión de rodilla izquierda</option>
+        </select>
+      </label>
+      <label>
+        Resolución:
+        <select id="resolution">
+          <option value="640x480" selected>640×480</option>
+          <option value="960x540">960×540</option>
+          <option value="1280x720">1280×720</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="stage">
+      <div class="badge">
+        <div class="stats">
+          <div class="stat"><div class="label">Repeticiones</div><div class="value" id="reps">0</div></div>
+          <div class="stat"><div class="label">Ángulo</div><div class="value" id="angle">–</div></div>
+          <div class="stat"><div class="label">FPS</div><div class="value" id="fps">–</div></div>
+        </div>
+      </div>
+      <video id="input_video" playsinline></video>
+      <canvas id="output_canvas"></canvas>
+    </section>
+
+    <section class="panel">
+      <strong>Indicaciones rápidas</strong>
+      <ul class="tips">
+        <li>Colócate de pie, con luz frontal y fondo simple. Mantén todo el cuerpo dentro de la cámara.</li>
+        <li>Para el brazo: extiende y eleva hasta casi línea con la cabeza. Para la rodilla: flexiona como si fueras a sentarte.</li>
+        <li>El conteo registra una repetición cuando completas el ciclo <em>abajo → arriba → abajo</em>.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    Procesamiento on‑device. No se envía video a servidores. MVP educativo.
+  </footer>
+
+  <!-- MediaPipe (versión clásica) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils"></script>
+
+  <script>
+    // Utilidades de dibujo de MediaPipe
+    const { drawConnectors, drawLandmarks } = window;
+    const { POSE_CONNECTIONS } = window;
+
+    // Elementos de UI
+    const videoEl = document.getElementById('input_video');
+    const canvasEl = document.getElementById('output_canvas');
+    const ctx = canvasEl.getContext('2d');
+    const repsEl = document.getElementById('reps');
+    const angleEl = document.getElementById('angle');
+    const fpsEl = document.getElementById('fps');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const selExercise = document.getElementById('exercise');
+    const selRes = document.getElementById('resolution');
+    const chkVoice = document.getElementById('chkVoice');
+
+    // Estado del ejercicio
+    let camera = null;
+    let reps = 0;
+    let phase = 'down'; // down -> up -> down (cuenta)
+    let lastTs = performance.now();
+    let frames = 0;
+    let speakingCooldown = 0; // ms
+
+    function say(text){
+      if(!chkVoice.checked) return;
+      const now = performance.now();
+      if(now < speakingCooldown) return;
+      speakingCooldown = now + 1200; // evita hablar demasiado
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'es-AR';
+      speechSynthesis.speak(u);
+    }
+
+    function toRad(d){return d * Math.PI / 180}
+    function dist(a,b){return Math.hypot(a.x-b.x, a.y-b.y)}
+    function angleABC(a,b,c){
+      // Ángulo en B (en grados) formado por puntos A-B-C
+      const ab = {x:a.x-b.x, y:a.y-b.y};
+      const cb = {x:c.x-b.x, y:c.y-b.y};
+      const dot = ab.x*cb.x + ab.y*cb.y;
+      const mag = Math.hypot(ab.x,ab.y)*Math.hypot(cb.x,cb.y) || 1e-6;
+      const cos = Math.min(1, Math.max(-1, dot/mag));
+      return Math.round(Math.acos(cos)*180/Math.PI);
+    }
+
+    function clamp(v,min,max){return Math.max(min,Math.min(max,v))}
+
+    function getLandmarkSafe(landmarks, idx){
+      const lm = landmarks?.[idx];
+      if(!lm || lm.visibility !== undefined && lm.visibility < 0.1) return null;
+      return lm;
+    }
+
+    function computeAngleForExercise(landmarks, exercise){
+      if(!landmarks) return null;
+      // Índices MP Pose: hombro 11/12, codo 13/14, muñeca 15/16, cadera 23/24, rodilla 25/26, tobillo 27/28
+      switch(exercise){
+        case 'arm_right':{
+          const sh = getLandmarkSafe(landmarks, 12);
+          const el = getLandmarkSafe(landmarks, 14);
+          const wr = getLandmarkSafe(landmarks, 16);
+          if(!sh||!el||!wr) return null;
+          return angleABC(sh, el, wr); // ángulo de codo
+        }
+        case 'arm_left':{
+          const sh = getLandmarkSafe(landmarks, 11);
+          const el = getLandmarkSafe(landmarks, 13);
+          const wr = getLandmarkSafe(landmarks, 15);
+          if(!sh||!el||!wr) return null;
+          return angleABC(sh, el, wr);
+        }
+        case 'knee_right':{
+          const hp = getLandmarkSafe(landmarks, 24);
+          const kn = getLandmarkSafe(landmarks, 26);
+          const an = getLandmarkSafe(landmarks, 28);
+          if(!hp||!kn||!an) return null;
+          return angleABC(hp, kn, an); // ángulo de rodilla
+        }
+        case 'knee_left':{
+          const hp = getLandmarkSafe(landmarks, 23);
+          const kn = getLandmarkSafe(landmarks, 25);
+          const an = getLandmarkSafe(landmarks, 27);
+          if(!hp||!kn||!an) return null;
+          return angleABC(hp, kn, an);
+        }
+      }
+      return null;
+    }
+
+    function evalExercise(angle, exercise){
+      // Devuelve {isUp, hints}
+      if(angle==null) return {isUp:false, hints:['Cuerpo fuera de cuadro']};
+      if(exercise.startsWith('arm')){
+        // brazo: up >= 160°, down <= 60°
+        const hints=[];
+        if(angle < 140) hints.push('Eleva un poco más el brazo');
+        return {isUp: angle >= 160, isDown: angle <= 60, hints};
+      } else {
+        // rodilla: posición baja 60–90°; up ~ 160–180°
+        const hints=[];
+        if(angle > 110) hints.push('Flexiona más la rodilla');
+        return {isUp: angle >= 150, isDown: angle <= 90, hints};
+      }
+    }
+
+    function draw(results, angle, qualityColor){
+      const w = results.image.width, h = results.image.height;
+      if(canvasEl.width !== w){ canvasEl.width = w; canvasEl.height = h; }
+      ctx.save();
+      ctx.clearRect(0,0,w,h);
+      ctx.drawImage(results.image, 0, 0, w, h);
+
+      // Pose overlay
+      if(results.poseLandmarks){
+        drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, { lineWidth: 4, color: qualityColor || '#33ff99' });
+        drawLandmarks(ctx, results.poseLandmarks, { lineWidth: 2, color: '#ffffff' });
+      }
+
+      // Ángulo en pantalla
+      if(angle!=null){
+        ctx.fillStyle = '#0e1530cc';
+        ctx.strokeStyle = '#273055';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.roundRect(w-150, 12, 138, 48, 10);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = '#9fb2e8';
+        ctx.font = '12px system-ui';
+        ctx.fillText('Ángulo', w-135, 30);
+        ctx.fillStyle = '#e9eefc';
+        ctx.font = '22px system-ui';
+        ctx.fillText(`${angle}°`, w-135, 50);
+      }
+      ctx.restore();
+    }
+
+    // Polyfill para roundRect en Canvas (por si acaso)
+    if(!CanvasRenderingContext2D.prototype.roundRect){
+      CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
+        if(typeof r === 'number') r = {tl:r,tr:r,br:r,bl:r};
+        this.beginPath();
+        this.moveTo(x+r.tl, y);
+        this.lineTo(x+w-r.tr, y);
+        this.quadraticCurveTo(x+w, y, x+w, y+r.tr);
+        this.lineTo(x+w, y+h-r.br);
+        this.quadraticCurveTo(x+w, y+h, x+w-r.br, y+h);
+        this.lineTo(x+r.bl, y+h);
+        this.quadraticCurveTo(x, y+h, x, y+h-r.bl);
+        this.lineTo(x, y+r.tl);
+        this.quadraticCurveTo(x, y, x+r.tl, y);
+        this.closePath();
+        return this;
+      }
+    }
+
+    // MediaPipe Pose
+    const pose = new Pose.Pose({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+    });
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      enableSegmentation: false,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    pose.onResults(onResults);
+
+    async function onResults(results){
+      // FPS
+      frames++;
+      const now = performance.now();
+      if(now - lastTs >= 1000){
+        fpsEl.textContent = frames.toString();
+        frames = 0; lastTs = now;
+      }
+
+      const angle = computeAngleForExercise(results.poseLandmarks, selExercise.value);
+      angleEl.textContent = angle==null ? '–' : angle.toString();
+      const {isUp, isDown, hints} = evalExercise(angle, selExercise.value);
+
+      // Máquina de estados para contar reps
+      if(phase === 'down' && isUp){
+        phase = 'up';
+        say('Arriba');
+      } else if(phase === 'up' && isDown){
+        phase = 'down';
+        reps++;
+        repsEl.textContent = reps.toString();
+        say('Correcto');
+      }
+
+      // Color de calidad
+      const qualityColor = isUp ? '#56ffa0' : (isDown ? '#6aa7ff' : '#ff5d7a');
+
+      // Feedback de corrección
+      if(hints.length && (angle!=null)){
+        if(!isUp && selExercise.value.startsWith('arm') && angle < 140){
+          say('Sube un poco más el brazo');
+        }
+        if(!isDown && selExercise.value.startsWith('knee') && angle > 110){
+          say('Flexiona más la rodilla');
+        }
+      }
+
+      draw(results, angle, qualityColor);
+    }
+
+    function getConstraints(){
+      const [w,h] = selRes.value.split('x').map(Number);
+      return {
+        audio:false,
+        video:{ facingMode: 'user', width: {ideal: w}, height: {ideal: h} }
+      };
+    }
+
+    async function startCamera(){
+      reps = 0; phase = 'down'; repsEl.textContent = '0';
+      const constraints = getConstraints();
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      videoEl.srcObject = stream;
+      await videoEl.play();
+
+      const w = videoEl.videoWidth || 640;
+      const h = videoEl.videoHeight || 480;
+      canvasEl.width = w; canvasEl.height = h;
+
+      if(camera) camera.stop();
+      camera = new Camera.Camera(videoEl, {
+        onFrame: async () => { await pose.send({image: videoEl}); },
+        width: w,
+        height: h
+      });
+      camera.start();
+    }
+
+    function stopCamera(){
+      if(camera){ camera.stop(); camera = null; }
+      const stream = videoEl.srcObject;
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); }
+      videoEl.srcObject = null;
+      fpsEl.textContent = '–';
+    }
+
+    // Eventos UI
+    btnStart.addEventListener('click', startCamera);
+    btnStop.addEventListener('click', stopCamera);
+    selRes.addEventListener('change', ()=>{ if(camera) startCamera(); });
+
+    // Autostart (opcional): comentar la siguiente línea si no quieres que inicie sola
+    // startCamera();
+  </script>
+</body>
+</html>
